@@ -1,5 +1,4 @@
 from multiprocessing import Pipe, Process
-from multiprocessing.connection import Connection
 
 
 class ValueObject:
@@ -83,6 +82,7 @@ class ModuleManagerTest:
         self.modules = list()
 
         # initialize individual modules as multiprocessing.Process
+        # prepare input / output pipes before calling start()
         for module in ModuleManagerTest.MODULES:
             pipe_in, pipe_out = Pipe()
             self.module_input[module.NAMESPACE] = pipe_in
@@ -91,29 +91,31 @@ class ModuleManagerTest:
         # as arguments for Process seems to be copied at the moment of calling start(),
         # delay calling start() after all process input / output pipes initialized.
         for module in ModuleManagerTest.MODULES:
-            process_params = (module, self.module_output[module.NAMESPACE])
+            module = module()
+            module.prepare()
+
+            process_params = (module, self.module_output, self.module_input)
             process = Process(target=self._handle_process, args=process_params)
             process.start()
 
-    def _handle_process(self, module: ModuleTest, pipe_out: Connection):
+    def _handle_process(self, module: ModuleTest, pipes_out: dict, pipes_in: dict):
         """
         process and route request.
         """
 
-        module = module()
-        module.prepare()
+        namespace = module.NAMESPACE
 
         # TODO should we name process?
 
         while True:
-            value_object: ValueObject = pipe_out.recv()
+            value_object: ValueObject = pipes_out[namespace].recv()
             value_object = module.process(value_object=value_object)
 
             # if there're remaining namespaces, route it.
             if value_object.module_namespaces:
                 namespace_next = value_object.module_namespaces.pop(0)
                 print('Sending to:', namespace_next)
-                self.module_input[namespace_next].send(value_object)
+                pipes_in[namespace_next].send(value_object)
             # else if there's no remaining namespace, send it to Provider
             else:
                 print('Ending process.')
