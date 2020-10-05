@@ -1,15 +1,20 @@
+from multiprocessing import Pipe, Process
+from multiprocessing.connection import Connection
+
+
 class ValueObject:
 
-    def __init__(self, value=0, module_namespaces=[]):
+    def __init__(self, value=0, module_namespaces=None):
         self.value = value
-        self.module_namespaces = module_namespaces
+        self.module_namespaces = module_namespaces or list()
 
 
 class ModuleTest:
 
-    def __init__(self, pipe_in, pipe_out):
-        self.pipe_in = pipe_in
-        self.pipe_out = pipe_out
+    NAMESPACE = None
+
+    def __init__(self):
+        pass
 
     def _prepare(self):
         print(f'Module initialized: [{self.__class__.NAMESPACE}]')
@@ -21,9 +26,6 @@ class ModuleTest:
         raise NotImplementedError
 
     def process(self, value_object: ValueObject) -> ValueObject:
-        # value_object: ValueObject = self.pipe_in.recv()
-        # value_object = self._process(value_object=value_object)
-        # self.pipe_out.send(value_object)
         return self._process(value_object=value_object)
 
 
@@ -63,10 +65,6 @@ class ModuleTestDivide(ModuleTest):
         return value_object
 
 
-from multiprocessing import Pipe, Process
-from threading import Thread
-
-
 class ModuleManagerTest:
 
     MODULES = {
@@ -77,90 +75,123 @@ class ModuleManagerTest:
     }
 
     def __init__(self):
-        self.modules = dict()
+        # initialize Pipe for finish
+        self.process_input, self.process_output = Pipe()
+
         self.module_input = dict()
         self.module_output = dict()
-        self.routing_threads = list()
+        self.modules = list()
 
+        # initialize individual modules as multiprocessing.Process
         for module in ModuleManagerTest.MODULES:
-            module_input, module_output = Pipe()
-            self.module_input[module.NAMESPACE] = module_input
-            self.module_output[module.NAMESPACE] = module_output
+            pipe_in, pipe_out = Pipe()
+            self.module_input[module.NAMESPACE] = pipe_in
+            self.module_output[module.NAMESPACE] = pipe_out
 
-            self.modules[module.NAMESPACE] = module(module_input, module_output)
-            self.modules[module.NAMESPACE].prepare()
+        # as arguments for Process seems to be copied at the moment of calling start(),
+        # delay calling start() after all process input / output pipes initialized.
+        for module in ModuleManagerTest.MODULES:
+            process_params = (module, self.module_output[module.NAMESPACE])
+            process = Process(target=self._handle_process, args=process_params)
+            process.start()
 
-            routing_thread = Thread(target=self.route, args=(module_output, module.NAMESPACE,), daemon=True)
-            routing_thread.start()
-            self.routing_threads.append(routing_thread)
-
-        # setting consumer handler?
-        self.input, self.output = Pipe()
-        consumer_handler = Thread(target=self.route, args=(self.output, 'consumer_handler',), daemon=True)
-        consumer_handler.start()
-        self.routing_threads.append(consumer_handler)
-
-    def route(self, module_output, namespace_for_debug):
+    def _handle_process(self, module: ModuleTest, pipe_out: Connection):
         """
-        receive module process output from individual modules,
-        forward it to another module (or Provider) referencing namespace in module chain
+        process and route request.
         """
 
-        value_object: ValueObject = module_output.recv()
-        print(f'[{namespace_for_debug}] Received:', value_object.value)
+        module = module()
+        module.prepare()
 
-        # if there're remaining namespaces, route it.
-        if value_object.module_namespaces:
-            namespace = value_object.module_namespaces.pop(0)
-            print('Sending to:', namespace)
-            # self.module_input[value_object.module_namespaces.pop(0)].send(value_object)
-            self.modules[namespace].process(value_object)
-            self.module_output[namespace].send(value_object)
-        # else if there's no remaining namespace, send it to Provider
-        else:
-            print('Ending process.')
-            self.provide(value_object)
+        # TODO should we name process?
 
-    def provide(self, value_object: ValueObject):
+        while True:
+            value_object: ValueObject = pipe_out.recv()
+            value_object = module.process(value_object=value_object)
+
+            # if there're remaining namespaces, route it.
+            if value_object.module_namespaces:
+                namespace_next = value_object.module_namespaces.pop(0)
+                print('Sending to:', namespace_next)
+                self.module_input[namespace_next].send(value_object)
+            # else if there's no remaining namespace, send it to Provider
+            else:
+                print('Ending process.')
+                self.process_input.send(value_object)
+
+    def _consume(self) -> ValueObject:
         """
-        finish routing request and hand it over to output.
-        currently, just print result value simply for debug.
+        receive request, prepare as ValueObject and feed into module chain.
         """
 
-        print('Request done. Result value: ', value_object.value)
+        raise NotImplementedError
+
+    def _finish(self, value_object: ValueObject):
+        """
+        finish processed request, sending it out.
+        """
+
+        raise NotImplementedError
 
     def start(self):
         """
-        start consuming request from implementable any sources.
+        start consuming and processing requests.
         """
 
         print('Start consuming.')
 
+        try:
+            while True:
+                # initialize request and feed into module chain
+                value_object: ValueObject = self._consume()
+                namespace_next = value_object.module_namespaces.pop(0)
+                print('Sending to:', namespace_next)
+                self.module_input[namespace_next].send(value_object)
+
+                # wait and receive processed result and send it out.
+                value_object: ValueObject = self.process_output.recv()
+                self._finish(value_object=value_object)
+
+        except KeyboardInterrupt:
+            print('Process stopped.')
+
+
+class ModuleManagerSimpleTest(ModuleManagerTest):
+
+    def _consume(self) -> ValueObject:
         namespaces = list()
         namespaces_available = [m.NAMESPACE for m in ModuleManagerTest.MODULES]
 
         while True:
-            try:
-                text = input()
+            # receive keyboard input
+            text = input()
 
-                if text == 'quit':
-                    print('Process quit.')
-                    break
-                elif text in namespaces_available:
-                    namespaces.append(text)
-                    print('Current modules:', namespaces)
-                elif text == 'go':
-                    print('Job launched:', namespaces)
-                    self.input.send(ValueObject(module_namespaces=namespaces.copy()))
-                    namespaces = list()
-                else:
-                    print('Available namespaces:', namespaces_available)
-
-            except KeyboardInterrupt as _:
+            # 'quit': exit process
+            if text == 'quit':
                 print('Process quit.')
-                break
+                raise KeyboardInterrupt
+
+            # 'go': send request with selected module namespaces
+            elif text == 'go':
+                if not namespaces:
+                    print('Job have no process.')
+                    continue
+
+                print('Job launched:', namespaces)
+                return ValueObject(value=0, module_namespaces=namespaces.copy())
+
+            # available namespace: add to module namespaces
+            elif text in namespaces_available:
+                namespaces.append(text)
+                print('Current modules:', namespaces)
+
+            else:
+                print('Available namespaces:', namespaces_available)
+
+    def _finish(self, value_object: ValueObject):
+        print('Job finished:', value_object.value)
 
 
 if __name__ == '__main__':
-    manager = ModuleManagerTest()
+    manager = ModuleManagerSimpleTest()
     manager.start()
